@@ -6,3 +6,9 @@
 __pycache__/
 *.obj
 *.o
+
+# Local inputs and rendered iPhone frames
+/iphone_nvs_validation_bundle/
+/iphone_nvs_validation_bundle.tar.gz
+/results/iphone/**/preview.png
+/results/iphone/**/frames-*/

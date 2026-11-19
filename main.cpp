@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -97,28 +98,52 @@ Frame render(const Camera& camera, const Scene& scene) {
     return image;
 }
 
-struct Sample { double x, y, z; Vec rgb; };
+struct Sample {
+    double x = 0, y = 0, z = infinity;
+    Vec rgb;
+};
+
+Sample project_pixel(const Pixel& pixel, Vec ray, const Camera& source, const Camera& target,
+                     const Intrinsics& target_k) {
+    if (!std::isfinite(pixel.depth) || pixel.depth <= 0) return {};
+    const Vec world = source.center + source.rotation(ray * pixel.depth);
+    const Vec p = target.to_camera(world);
+    if (p.z <= 1e-6) return {};
+    return {target_k.fx * p.x / p.z + target_k.u0, target_k.fy * p.y / p.z + target_k.v0,
+            p.z, pixel.rgb};
+}
+
+bool reaches_image(const Sample& s, const Intrinsics& k) {
+    return std::isfinite(s.z) && s.x > -1 && s.x < k.cols && s.y > -1 && s.y < k.rows;
+}
 
 std::vector<Sample> reproject(const Frame& frame, const Camera& source, const Camera& target, const Intrinsics& k = {}) {
     std::vector<Sample> samples;
     samples.reserve(frame.size());
     for (int y = 0; y < k.rows; ++y) {
         for (int x = 0; x < k.cols; ++x) {
-            const Pixel& pixel = frame[y * k.cols + x];
-            if (!std::isfinite(pixel.depth) || pixel.depth <= 0) continue;
-            const Vec world = source.center + source.rotation(k.ray(x, y) * pixel.depth);
-            const Vec p = target.to_camera(world);
-            if (p.z <= 1e-6) continue;
-            const double u = k.fx * p.x / p.z + k.u0, v = k.fy * p.y / p.z + k.v0;
-            if (u > -1 && u < k.cols && v > -1 && v < k.rows)
-                samples.push_back({u, v, p.z, pixel.rgb});
+            const Sample s = project_pixel(frame[y * k.cols + x], k.ray(x, y), source, target, k);
+            if (reaches_image(s, k)) samples.push_back(s);
         }
     }
     return samples;
 }
 
 template<class Write>
-void splat(const Sample& s, const Intrinsics& k, Write write) {
+void splat(const Sample& s, const Intrinsics& k, Write write, double radius = 1) {
+    if (radius > 1) {
+        const int xmin = static_cast<int>(std::max(0.0, std::ceil(s.x - radius)));
+        const int xmax = static_cast<int>(std::min(k.cols - 1.0, std::floor(s.x + radius)));
+        const int ymin = static_cast<int>(std::max(0.0, std::ceil(s.y - radius)));
+        const int ymax = static_cast<int>(std::min(k.rows - 1.0, std::floor(s.y + radius)));
+        for (int y = ymin; y <= ymax; ++y) {
+            for (int x = xmin; x <= xmax; ++x) {
+                const double weight = (1 - std::abs(s.x - x) / radius) * (1 - std::abs(s.y - y) / radius);
+                if (weight > 1e-7) write(y * k.cols + x, weight);
+            }
+        }
+        return;
+    }
     const int left = static_cast<int>(std::floor(s.x)), top = static_cast<int>(std::floor(s.y));
     const double fx = s.x - left, fy = s.y - top;
     for (int dy = 0; dy <= 1; ++dy) {
@@ -142,17 +167,17 @@ Frame nearest(const std::vector<Sample>& samples) {
     return frame;
 }
 
-Frame bilinear(const std::vector<Sample>& samples, double gate, const Intrinsics& k = {}) {
+Frame bilinear(const std::vector<Sample>& samples, double gate, const Intrinsics& k = {}, double radius = 1) {
     Frame frame(k.cols * k.rows);
     std::vector<double> weights(frame.size(), 0);
     for (const Sample& s : samples)
-        splat(s, k, [&](int i, double) { frame[i].depth = std::min(frame[i].depth, s.z); });
+        splat(s, k, [&](int i, double) { frame[i].depth = std::min(frame[i].depth, s.z); }, radius);
     for (const Sample& s : samples) {
         splat(s, k, [&](int i, double w) {
             if (s.z - frame[i].depth > gate) return;
             frame[i].rgb = frame[i].rgb + s.rgb * w;
             weights[i] += w;
-        });
+        }, radius);
     }
     for (std::size_t i = 0; i < frame.size(); ++i)
         if (weights[i] > 0) frame[i].rgb = frame[i].rgb * (1 / weights[i]);
@@ -219,6 +244,297 @@ Frame read_rgbd(const std::filesystem::path& path, const Intrinsics& k) {
     return frame;
 }
 
+
+Camera read_camera(std::istream& input, double r00) {
+    Camera camera{};
+    camera.axes[0].x = r00;
+    if (!(input >> camera.axes[1].x >> camera.axes[2].x >> camera.center.x
+                >> camera.axes[0].y >> camera.axes[1].y >> camera.axes[2].y >> camera.center.y
+                >> camera.axes[0].z >> camera.axes[1].z >> camera.axes[2].z >> camera.center.z))
+        throw std::runtime_error("Incomplete camera-to-world transform");
+    return camera;
+}
+
+double edge(const Sample& a, const Sample& b, double x, double y) {
+    return (b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x);
+}
+
+void rasterize(const Sample& a, const Sample& b, const Sample& c, const Intrinsics& k, Frame& frame) {
+    const double area = edge(a, b, c.x, c.y);
+    if (std::abs(area) < 1e-8) return;
+    const double left = std::max(0.0, std::ceil(std::min({a.x, b.x, c.x})));
+    const double right = std::min(k.cols - 1.0, std::floor(std::max({a.x, b.x, c.x})));
+    const double top = std::max(0.0, std::ceil(std::min({a.y, b.y, c.y})));
+    const double bottom = std::min(k.rows - 1.0, std::floor(std::max({a.y, b.y, c.y})));
+    if (left > right || top > bottom) return;
+    for (int y = static_cast<int>(top); y <= static_cast<int>(bottom); ++y) {
+        for (int x = static_cast<int>(left); x <= static_cast<int>(right); ++x) {
+            const double wa = edge(b, c, x, y) / area;
+            const double wb = edge(c, a, x, y) / area;
+            const double wc = 1 - wa - wb;
+            if (std::min({wa, wb, wc}) < -1e-8) continue;
+            const double ta = wa / a.z, tb = wb / b.z, tc = wc / c.z;
+            const double z = 1 / (ta + tb + tc);
+            Pixel& dst = frame[y * k.cols + x];
+            if (z < dst.depth) dst = {(a.rgb * ta + b.rgb * tb + c.rgb * tc) * z, z};
+        }
+    }
+}
+
+double surface_tolerance(double z) { return 0.012 + 0.035 * z; }
+
+bool continuous(double a, double b, double c) {
+    const double nearest = std::min({a, b, c});
+    return std::max({a, b, c}) - nearest <= surface_tolerance(nearest);
+}
+
+Frame mesh_render(const Frame& source, const std::vector<Sample>& projected, const Intrinsics& source_k,
+                  const Intrinsics& target_k, bool gate) {
+    Frame rendered(target_k.cols * target_k.rows);
+    const auto triangle = [&](int i, int j, int k) {
+        if (!std::isfinite(projected[i].z) || !std::isfinite(projected[j].z) ||
+            !std::isfinite(projected[k].z)) return;
+        if (gate && !continuous(source[i].depth, source[j].depth, source[k].depth)) return;
+        rasterize(projected[i], projected[j], projected[k], target_k, rendered);
+    };
+    for (int y = 0; y + 1 < source_k.rows; ++y) {
+        for (int x = 0; x + 1 < source_k.cols; ++x) {
+            const int a = y * source_k.cols + x, b = a + 1, c = a + source_k.cols, d = c + 1;
+            const double ad = std::abs(source[a].depth - source[d].depth);
+            const double bc = std::abs(source[b].depth - source[c].depth);
+            // A diagonal with an invalid endpoint cannot support either triangle.
+            if (std::isfinite(ad) && (!std::isfinite(bc) || ad <= bc)) {
+                triangle(a, b, d);
+                triangle(a, d, c);
+            } else {
+                triangle(a, b, c);
+                triangle(b, d, c);
+            }
+        }
+    }
+    return rendered;
+}
+
+
+Frame complete_depth(const Frame& source, const Intrinsics& k, int radius) {
+    Frame completed = source;
+    constexpr double color_limit = 3 * 24.0 * 24.0;  // RGB squared distance.
+    for (int y = 0; y < k.rows; ++y) {
+        for (int x = 0; x < k.cols; ++x) {
+            const int index = y * k.cols + x;
+            const Pixel& hole = source[index];
+            if (valid(hole)) continue;
+            const int x0 = std::max(0, x - radius), x1 = std::min(k.cols - 1, x + radius);
+            const int y0 = std::max(0, y - radius), y1 = std::min(k.rows - 1, y + radius);
+            double seed = infinity, best_cost = infinity;
+            for (int ny = y0; ny <= y1; ++ny) {
+                for (int nx = x0; nx <= x1; ++nx) {
+                    const Pixel& sample = source[ny * k.cols + nx];
+                    if (!valid(sample)) continue;
+                    const Vec delta = sample.rgb - hole.rgb;
+                    const double color_distance = dot(delta, delta);
+                    if (color_distance > color_limit) continue;
+                    const int dx = nx - x, dy = ny - y;
+                    const double cost = dx * dx + dy * dy + 2 * color_distance / color_limit;
+                    if (cost < best_cost) {
+                        best_cost = cost;
+                        seed = sample.depth;
+                    }
+                }
+            }
+            if (!std::isfinite(seed)) continue;
+
+            // Fit inverse depth to a plane using only measured samples from a compatible surface.
+            double weight_sum = 0, xx = 0, yy = 0, zz = 0, xy = 0, xz = 0, yz = 0;
+            Vec mean;
+            int support = 0;
+            for (int ny = y0; ny <= y1; ++ny) {
+                for (int nx = x0; nx <= x1; ++nx) {
+                    const Pixel& sample = source[ny * k.cols + nx];
+                    if (!valid(sample) || std::abs(sample.depth - seed) > surface_tolerance(seed)) continue;
+                    const Vec delta = sample.rgb - hole.rgb;
+                    const double color_distance = dot(delta, delta);
+                    if (color_distance > color_limit) continue;
+                    const int dx = nx - x, dy = ny - y;
+                    const double w = 1 / ((1 + dx * dx + dy * dy) * (1 + color_distance / color_limit));
+                    const double iz = 1 / sample.depth;
+                    mean = mean + Vec{double(dx), double(dy), iz} * w;
+                    weight_sum += w;
+                    xx += w * dx * dx;
+                    yy += w * dy * dy;
+                    zz += w * iz * iz;
+                    xy += w * dx * dy;
+                    xz += w * dx * iz;
+                    yz += w * dy * iz;
+                    ++support;
+                }
+            }
+            if (support < 6) continue;
+            mean = mean * (1 / weight_sum);
+            xx = xx / weight_sum - mean.x * mean.x;
+            yy = yy / weight_sum - mean.y * mean.y;
+            zz = zz / weight_sum - mean.z * mean.z;
+            xy = xy / weight_sum - mean.x * mean.y;
+            xz = xz / weight_sum - mean.x * mean.z;
+            yz = yz / weight_sum - mean.y * mean.z;
+            const double det = xx * yy - xy * xy;
+            if (det < 0.1) continue;  // Reject poorly constrained one-dimensional neighborhoods.
+            const double a = (xz * yy - yz * xy) / det, b = (yz * xx - xz * xy) / det;
+            const double residual = zz - a * xz - b * yz;
+            const double inverse_depth_tolerance = 0.012 / (seed * seed);
+            if (residual > inverse_depth_tolerance * inverse_depth_tolerance) continue;
+            const double inverse_depth = mean.z - a * mean.x - b * mean.y;
+            if (inverse_depth <= 0) continue;
+            const double depth = 1 / inverse_depth;
+            if (std::abs(depth - seed) <= surface_tolerance(seed)) completed[index].depth = depth;
+        }
+    }
+    return completed;
+}
+
+void check_surfaces() {
+    const Intrinsics k{3, 3, 1, 1, 0, 0};
+    Frame image(k.cols * k.rows);
+    rasterize({0, 0, 2, {255, 0, 0}}, {2, 0, 4, {0, 0, 255}}, {0, 2, 4, {0, 0, 255}}, k, image);
+    if (std::abs(image[1].depth - 8.0 / 3.0) > 1e-10 || std::abs(image[1].rgb.x - 170) > 1e-10 ||
+        std::abs(image[1].rgb.z - 85) > 1e-10 || valid(image[8]) ||
+        !continuous(1.0, 1.01, 1.03) || continuous(1.0, 1.01, 1.3))
+        throw std::runtime_error("Mesh perspective or depth-edge self-check failed");
+
+    Frame plane(25, {{120, 110, 100}, 2});
+    plane[12].depth = infinity;
+    plane[0] = {{0, 0, 255}, infinity};
+    const Frame fixed = complete_depth(plane, {5, 5, 1, 1, 0, 0}, 2);
+    if (std::abs(fixed[12].depth - 2) > 1e-10 || valid(fixed[0]) || fixed[11].depth != plane[11].depth)
+        throw std::runtime_error("Depth completion self-check failed");
+}
+
+void write_rgba(std::ostream& stream, const Frame& frame, std::vector<unsigned char>& bytes) {
+    for (std::size_t i = 0; i < frame.size(); ++i) {
+        const Vec rgb = frame[i].rgb;
+        bytes[4 * i] = byte(rgb.x);
+        bytes[4 * i + 1] = byte(rgb.y);
+        bytes[4 * i + 2] = byte(rgb.z);
+        bytes[4 * i + 3] = valid(frame[i]) ? 255 : 0;
+    }
+    if (!stream.write(reinterpret_cast<const char*>(bytes.data()), bytes.size()))
+        throw std::runtime_error("Could not write rendered frame");
+}
+
+void run_paired(const std::filesystem::path& input, const std::filesystem::path& output) {
+    check_surfaces();
+    std::ifstream manifest(input / "pairs.txt");
+    int source_cols = 0, source_rows = 0, target_cols = 0, target_rows = 0, count = 0;
+    const auto valid_extent = [](int n) { return n >= 2 && n <= 4096; };
+    if (!(manifest >> source_cols >> source_rows >> target_cols >> target_rows >> count) ||
+        !valid_extent(source_cols) || !valid_extent(source_rows) ||
+        !valid_extent(target_cols) || !valid_extent(target_rows) ||
+        count < 1 || count > 10000) throw std::runtime_error("Invalid dimensions or frame count in pairs.txt");
+    const double radius = std::max(double(target_cols) / source_cols, double(target_rows) / source_rows);
+    const bool scaled = radius > 1;
+    const double footprint = std::max(1.0, radius);
+    const int repair_radius = std::max(2, int(std::ceil(5.0 / footprint)));
+
+    std::filesystem::create_directories(output);
+    std::ofstream rgba(output / "renders.rgba", std::ios::binary);
+    std::ofstream timing(output / "timing.csv");
+    if (!rgba || !timing) throw std::runtime_error("Could not open paired render outputs");
+    timing << "frame,projection_ms,splat_ms,scaled_splat_ms,mesh_open_ms,mesh_gated_ms,repair_ms\n";
+    timing << std::fixed << std::setprecision(4);
+    std::vector<unsigned char> bytes(static_cast<std::size_t>(target_cols) * target_rows * 4);
+    const auto read_k = [&](int cols, int rows) {
+        Intrinsics k{cols, rows};
+        if (!(manifest >> k.fx >> k.fy >> k.u0 >> k.v0) || k.fx <= 0 || k.fy <= 0)
+            throw std::runtime_error("Invalid calibration in pairs.txt");
+        return k;
+    };
+    const auto read_pose = [&]() {
+        double r00 = 0;
+        if (!(manifest >> r00)) throw std::runtime_error("Missing pose in pairs.txt");
+        return read_camera(manifest, r00);
+    };
+    using Clock = std::chrono::steady_clock;
+    const auto elapsed_ms = [](Clock::time_point begin, Clock::time_point end) {
+        return std::chrono::duration<double, std::milli>(end - begin).count();
+    };
+
+    for (int i = 0; i < count; ++i) {
+        const Intrinsics source_k = read_k(source_cols, source_rows);
+        const Intrinsics target_k = read_k(target_cols, target_rows);
+        const Camera source_camera = read_pose(), target_camera = read_pose();
+        const Frame source = read_rgbd(input / (std::to_string(i) + ".rgbd"), source_k);
+        const auto begin = Clock::now();
+        std::vector<Sample> grid(source.size()), samples;
+        samples.reserve(source.size());
+        for (int y = 0; y < source_rows; ++y) {
+            for (int x = 0; x < source_cols; ++x) {
+                const int index = y * source_cols + x;
+                const Sample s = project_pixel(source[index], source_k.ray(x, y), source_camera, target_camera, target_k);
+                grid[index] = s;
+                if (std::isfinite(s.z) && s.x > -footprint && s.y > -footprint &&
+                    s.x < target_cols - 1 + footprint && s.y < target_rows - 1 + footprint)
+                    samples.push_back(s);
+            }
+        }
+        const auto projected = Clock::now();
+        const Frame splatted = bilinear(samples, depth_gate, target_k);
+        const auto splat_done = Clock::now();
+        write_rgba(rgba, splatted, bytes);
+        timing << i << ',' << elapsed_ms(begin, projected) << ',' << elapsed_ms(projected, splat_done);
+
+        Frame wider;
+        double scaled_ms = 0;
+        if (scaled) {
+            const auto start = Clock::now();
+            wider = bilinear(samples, depth_gate, target_k, radius);
+            scaled_ms = elapsed_ms(start, Clock::now());
+            write_rgba(rgba, wider, bytes);
+        }
+        timing << ',' << scaled_ms;
+        const Frame& fallback = scaled ? wider : splatted;
+        Frame gated;
+        for (bool gate : {false, true}) {
+            const auto start = Clock::now();
+            Frame mesh = mesh_render(source, grid, source_k, target_k, gate);
+            // A splat covers isolated valid points and rejected or subpixel triangles.
+            for (std::size_t j = 0; j < mesh.size(); ++j)
+                if (!valid(mesh[j])) mesh[j] = fallback[j];
+            timing << ',' << elapsed_ms(start, Clock::now());
+            write_rgba(rgba, mesh, bytes);
+            if (gate) gated = std::move(mesh);
+        }
+
+        const auto repair_start = Clock::now();
+        const Frame completed = complete_depth(source, source_k, repair_radius);
+        std::vector<Sample> repaired_samples;
+        for (int y = 0; y < source_rows; ++y) {
+            for (int x = 0; x < source_cols; ++x) {
+                const int j = y * source_cols + x;
+                if (valid(source[j]) || !valid(completed[j])) continue;
+                const Sample s = project_pixel(completed[j], source_k.ray(x, y), source_camera, target_camera, target_k);
+                grid[j] = s;
+                if (std::isfinite(s.z) && s.x > -footprint && s.y > -footprint &&
+                    s.x < target_cols - 1 + footprint && s.y < target_rows - 1 + footprint)
+                    repaired_samples.push_back(s);
+            }
+        }
+        const Frame repaired_mesh = mesh_render(completed, grid, source_k, target_k, true);
+        const Frame repaired_splat = bilinear(repaired_samples, depth_gate, target_k, footprint);
+        // Preserve existing projected colors. Only infer geometry at missing source depth.
+        for (std::size_t j = 0; j < gated.size(); ++j) {
+            if (!valid(gated[j]))
+                gated[j] = valid(repaired_mesh[j]) ? repaired_mesh[j] : repaired_splat[j];
+        }
+        timing << ',' << elapsed_ms(repair_start, Clock::now()) << '\n';
+        write_rgba(rgba, gated, bytes);
+    }
+    std::string extra;
+    if (manifest >> extra) throw std::runtime_error("Unexpected records at end of pairs.txt");
+    timing.flush();
+    rgba.flush();
+    if (!timing || !rgba) throw std::runtime_error("Could not finish writing paired outputs");
+}
+
 double squared_distance(Vec a, Vec b) { const Vec d = a - b; return dot(d, d); }
 
 void report_multiview(std::ostream& csv, std::size_t target, std::size_t primary, const char* method,
@@ -262,13 +578,7 @@ void run_multiview(const std::filesystem::path& input, const std::filesystem::pa
         throw std::runtime_error("Invalid intrinsics in cameras.txt");
     std::vector<Camera> cameras;
     for (double r00; manifest >> r00;) {
-        Camera camera;
-        camera.axes[0].x = r00;
-        if (!(manifest >> camera.axes[1].x >> camera.axes[2].x >> camera.center.x
-                       >> camera.axes[0].y >> camera.axes[1].y >> camera.axes[2].y >> camera.center.y
-                       >> camera.axes[0].z >> camera.axes[1].z >> camera.axes[2].z >> camera.center.z))
-            throw std::runtime_error("Incomplete camera-to-world transform");
-        cameras.push_back(camera);
+        cameras.push_back(read_camera(manifest, r00));
     }
     if (!manifest.eof() || cameras.size() < 3) throw std::runtime_error("Expected at least three camera poses");
 
@@ -331,13 +641,18 @@ void check_occlusion() {
 }  // namespace
 
 int main(int argc, char** argv) try {
+    if (argc >= 2 && std::string(argv[1]) == "--paired") {
+        if (argc != 4) throw std::runtime_error("Usage: rgbd_demo --paired input output");
+        run_paired(argv[2], argv[3]);
+        return 0;
+    }
     if (argc >= 2 && std::string(argv[1]) == "--multiview") {
         if (argc != 4) throw std::runtime_error("Usage: rgbd_demo --multiview input output");
         run_multiview(argv[2], argv[3]);
         return 0;
     }
     if (argc > 2)
-        throw std::runtime_error("Usage: rgbd_demo [output_directory] or rgbd_demo --multiview input output");
+        throw std::runtime_error("Usage: rgbd_demo [output_directory] or rgbd_demo --multiview/--paired input output");
     const std::filesystem::path output = argc == 2 ? argv[1] : "results";
     std::filesystem::create_directories(output);
     std::ofstream csv(output / "metrics.csv");
