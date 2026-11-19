@@ -1,0 +1,8 @@
+/packed/
+/build/
+/fountain/
+/rgbd_demo
+/rgbd_demo.exe
+__pycache__/
+*.obj
+*.o
